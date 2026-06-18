@@ -21,7 +21,15 @@ class Config:
 
     # ── MCP Server (HTTP transport) ────────────
     MCP_HOST: str = os.getenv("MCP_HOST", "127.0.0.1")
-    MCP_PORT: int = int(os.getenv("MCP_PORT", "8001"))
+    port_raw = os.getenv("MCP_PORT")
+    try:
+        if port_raw:
+            MCP_PORT: int = int(port_raw)
+        else:
+            MCP_PORT: int = 8000
+    except (ValueError, TypeError):
+        # 读到$PORT、文字、乱码等无法转数字的值，自动降级默认端口
+        MCP_PORT: int = 8000
 
     # ── PostgreSQL / PGVector ──────────────────
     # SQLAlchemy-style connection string, e.g.
