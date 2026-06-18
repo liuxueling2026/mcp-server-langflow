@@ -16,11 +16,17 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
-
-
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Mount, Route
 
 from config import config
 from neo4j_client import run_cypher
@@ -31,11 +37,116 @@ from pgvector_client import search as pgvector_search_fn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("langflow-mcp-server")
 
+
+class MCPCompatibilityMiddleware:
+    """Loosen request-header requirements for local Langflow MCP clients.
+
+    Some clients probe `/mcp` with incomplete headers during handshake:
+      - GET /mcp without `Accept: text/event-stream`
+      - POST /mcp without an explicit `Accept: application/json`
+
+    The underlying FastMCP transport is stricter and returns 406/415 early.
+    This middleware normalizes those headers only for the `/mcp` endpoint so the
+    rest of the application behavior stays unchanged.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "").upper()
+
+        if path == "/mcp":
+            headers = list(scope.get("headers", []))
+
+            def _get_header(name: str) -> str:
+                name_bytes = name.lower().encode("latin-1")
+                for key, value in headers:
+                    if key.lower() == name_bytes:
+                        return value.decode("latin-1")
+                return ""
+
+            def _set_header(name: str, value: str) -> None:
+                name_bytes = name.lower().encode("latin-1")
+                value_bytes = value.encode("latin-1")
+                for index, (key, _old_value) in enumerate(headers):
+                    if key.lower() == name_bytes:
+                        headers[index] = (key, value_bytes)
+                        return
+                headers.append((name_bytes, value_bytes))
+
+            if method == "GET":
+                accept = _get_header("accept")
+                if "text/event-stream" not in accept.lower():
+                    merged = "text/event-stream" if not accept else f"{accept}, text/event-stream"
+                    _set_header("accept", merged)
+            elif method == "POST":
+                accept = _get_header("accept")
+                if "application/json" not in accept.lower():
+                    merged = "application/json" if not accept else f"{accept}, application/json"
+                    _set_header("accept", merged)
+
+            scope = {**scope, "headers": headers}
+
+        await self.app(scope, receive, send)
+
+
+class MCPProtocolDispatcher:
+    """Dispatch requests to the appropriate MCP transport sub-application.
+
+    We intentionally avoid copying Route objects out of FastMCP-generated apps.
+    Some of those routes wrap ASGI handlers in ways that break when re-mounted
+    as plain Starlette Route instances. Instead, we keep the original sub-apps
+    intact and forward requests by path.
+    """
+
+    def __init__(self, streamable_app, sse_app):
+        self.streamable_app = streamable_app
+        self.sse_app = sse_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.streamable_app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path == "/mcp":
+            await self.streamable_app(scope, receive, send)
+            return
+
+        if path == "/sse" or path.startswith("/messages/"):
+            await self.sse_app(scope, receive, send)
+            return
+
+        response = PlainTextResponse("Not Found", status_code=404)
+        await response(scope, receive, send)
+
+
 # Create the FastMCP instance, bound to the configured host/port for HTTP.
 mcp = FastMCP(
     name="langflow-neo4j-mcp",
     host=config.MCP_HOST,
     port=config.MCP_PORT,
+    # Prefer JSON responses on the Streamable HTTP endpoint. This is generally
+    # easier for browser-hosted clients such as Langflow to negotiate than SSE
+    # response mode on POST /mcp.
+    json_response=True,
+    # Langflow probes /mcp before it has any session state. In FastMCP's default
+    # stateful mode, a bare GET /mcp creates a session-bound transport and then
+    # immediately fails with "Missing session ID" (400). Stateless mode is more
+    # compatible with browser clients performing lightweight capability probes.
+    stateless_http=True,
+    # Langflow desktop / local web clients may send an Origin header that does
+    # not match FastMCP's localhost default allowlist. Disable this protection
+    # for local development so MCP handshake/probing requests are not rejected.
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
 )
 
 
@@ -231,8 +342,66 @@ def pgvector_search(collection: str, search_data: Any = None,
 
 
 
-if __name__ == "__main__":
+async def health(_request):
+    """Simple health endpoint to verify the process is reachable."""
+    return JSONResponse(
+        {
+            "status": "ok",
+            "streamable_http": f"http://{config.MCP_HOST}:{config.MCP_PORT}/mcp",
+            "sse": f"http://{config.MCP_HOST}:{config.MCP_PORT}/sse",
+            "messages": f"http://{config.MCP_HOST}:{config.MCP_PORT}/messages/",
+        }
+    )
 
+
+def build_compat_app() -> Starlette:
+    """Expose both Streamable HTTP and legacy SSE on the same port.
+
+    This makes the server compatible with Langflow versions that first try
+    Streamable HTTP and then fall back to SSE.
+
+    Important for browser-hosted Langflow:
+    Langflow UI runs on a different origin (typically localhost:7860), so MCP
+    requests from the browser are cross-origin. We must explicitly allow CORS,
+    otherwise the browser blocks the request before FastMCP even handles it.
+    """
+    streamable_app = mcp.streamable_http_app()
+    sse_app = mcp.sse_app()
+    dispatcher = MCPProtocolDispatcher(streamable_app, sse_app)
+
+    combined_routes = [
+        Route("/health", endpoint=health, methods=["GET"]),
+        Mount("/", app=dispatcher),
+    ]
+
+    cors_middleware = [
+        Middleware(MCPCompatibilityMiddleware),
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["Mcp-Session-Id", "mcp-session-id"],
+            allow_credentials=False,
+            max_age=600,
+        ),
+    ]
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        # Start the Streamable HTTP session manager used by FastMCP.
+        async with mcp.session_manager.run():
+            yield
+
+    return Starlette(
+        debug=False,
+        routes=combined_routes,
+        middleware=cors_middleware,
+        lifespan=lifespan,
+    )
+
+
+if __name__ == "__main__":
     missing = config.validate_neo4j()
     if missing:
         logger.warning(
@@ -240,10 +409,18 @@ if __name__ == "__main__":
             "but neo4j_query calls will fail until .env is filled in.",
             ", ".join(missing),
         )
-    logger.info(
-        "Starting MCP server on http://%s:%d/mcp (Streamable HTTP transport)",
-        config.MCP_HOST,
-        config.MCP_PORT,
+
+    app = build_compat_app()
+
+    logger.info("Starting MCP server in compatibility mode")
+    logger.info("  Streamable HTTP: http://%s:%d/mcp", config.MCP_HOST, config.MCP_PORT)
+    logger.info("  Legacy SSE:      http://%s:%d/sse", config.MCP_HOST, config.MCP_PORT)
+    logger.info("  Messages:        http://%s:%d/messages/", config.MCP_HOST, config.MCP_PORT)
+    logger.info("  Health:          http://%s:%d/health", config.MCP_HOST, config.MCP_PORT)
+
+    uvicorn.run(
+        app,
+        host=config.MCP_HOST,
+        port=config.MCP_PORT,
+        log_level="info",
     )
-    # Streamable HTTP transport (preferred over legacy SSE).
-    mcp.run(transport="streamable-http")

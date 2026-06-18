@@ -8,7 +8,9 @@ import os
 from dotenv import load_dotenv
 
 # Load .env file from the mcp_server directory if present.
-load_dotenv()
+# Use override=True so the local .env remains the source of truth even if
+# VS Code / terminal / launcher already exported older MCP_* values.
+load_dotenv(override=True)
 
 
 class Config:
@@ -19,7 +21,7 @@ class Config:
 
     # ── MCP Server (HTTP transport) ────────────
     MCP_HOST: str = os.getenv("MCP_HOST", "127.0.0.1")
-    MCP_PORT: int = int(os.getenv("MCP_PORT", "8000"))
+    MCP_PORT: int = int(os.getenv("MCP_PORT", "8001"))
 
     # ── PostgreSQL / PGVector ──────────────────
     # SQLAlchemy-style connection string, e.g.
