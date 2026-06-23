@@ -342,14 +342,16 @@ def pgvector_search(collection: str, search_data: Any = None,
 
 
 
-async def health(_request):
+async def health(request):
     """Simple health endpoint to verify the process is reachable."""
+    # 自动获取浏览器/ICA访问的完整公网根域名（带https）
+    base_url = str(request.base_url).rstrip("/")
     return JSONResponse(
         {
             "status": "ok",
-            "streamable_http": f"http://{config.MCP_HOST}:{config.MCP_PORT}/mcp",
-            "sse": f"http://{config.MCP_HOST}:{config.MCP_PORT}/sse",
-            "messages": f"http://{config.MCP_HOST}:{config.MCP_PORT}/messages/",
+            "streamable_http": f"{base_url}/mcp",
+            "sse": f"{base_url}/sse",
+            "messages": f"{base_url}/messages/",
         }
     )
 
