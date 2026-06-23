@@ -162,21 +162,28 @@ _embedder = None
 
 
 def get_embedder():
-    """Return a cached LangChain-compatible embedder selected via `.env`."""
     global _embedder
     if _embedder is not None:
         return _embedder
 
     provider = (config.EMBEDDING_PROVIDER or "ollama").lower()
-    model = config.EMBEDDING_MODEL
     base_url = config.EMBEDDING_BASE_URL
     api_key = config.EMBEDDING_API_KEY
 
     if provider == "ollama":
+        model = config.EMBEDDING_MODEL or "nomic-embed-text"
         impl = OllamaEmbedder(model=model, base_url=base_url or "http://localhost:11434")
     elif provider in ("openai", "openai-compatible"):
+        model = config.EMBEDDING_MODEL
         impl = OpenAIEmbedder(model=model, base_url=base_url or None, api_key=api_key or None)
     elif provider in ("watsonx", "watsonx.ai", "ibm"):
+        # 关键改动：读取EMBEDDING_MODEL_NAME，不再共用EMBEDDING_MODEL
+        model = config.EMBEDDING_MODEL_NAME
+        if not model:
+            raise ValueError(
+                "EMBEDDING_PROVIDER=watsonx requires env variable EMBEDDING_MODEL_NAME, "
+                "e.g. ibm/granite-embedding-278m-multilingual"
+            )
         impl = WatsonxEmbedder(
             model=model,
             url=config.WATSONX_URL,
@@ -189,7 +196,6 @@ def get_embedder():
             f"Unsupported EMBEDDING_PROVIDER '{provider}'. "
             "Use 'ollama', 'openai', or 'watsonx'."
         )
-
 
     _embedder = LangChainEmbeddingsAdapter(impl)
     return _embedder

@@ -38,7 +38,8 @@ class Config:
 
     # ── Embedding provider (pluggable) ─────────
     EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "ollama")
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+    EMBEDDING_MODEL: str | None = os.getenv("EMBEDDING_MODEL")
+    EMBEDDING_MODEL_NAME: str | None = os.getenv("EMBEDDING_MODEL_NAME")
     EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL", "http://localhost:11434")
     EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
     EMBEDDING_USE_TASK_PREFIX: bool = (
@@ -51,6 +52,19 @@ class Config:
     WATSONX_PROJECT_ID: str = os.getenv("WATSONX_PROJECT_ID", "")
     WATSONX_SPACE_ID: str = os.getenv("WATSONX_SPACE_ID", "")
 
+    @classmethod
+    def validate_watsonx(cls) -> list[str]:
+        missing = []
+        if cls.EMBEDDING_PROVIDER.lower() == "watsonx":
+            if not cls.EMBEDDING_MODEL_NAME:
+                missing.append("EMBEDDING_MODEL_NAME")
+            if not cls.WATSONX_API_KEY:
+                missing.append("WATSONX_API_KEY")
+            if not cls.WATSONX_PROJECT_ID:
+                missing.append("WATSONX_PROJECT_ID")
+            if not cls.WATSONX_URL:
+                missing.append("WATSONX_URL")
+        return missing
 
     @classmethod
     def validate_neo4j(cls) -> list[str]:
