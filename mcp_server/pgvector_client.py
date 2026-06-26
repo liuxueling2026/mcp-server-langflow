@@ -1,18 +1,23 @@
-"""PGVector ingest + hybrid-rerank search.
+"""PGVector ingest + hybrid-rerank search (Fully upgraded to V03 capabilities).
 
-Migrated from the core data logic of the Langflow custom component
-`components/pgvector_combined.py`. All Langflow-specific glue (Loop end signal,
-self.status, Message/DataFrame outputs, single-JSON search_data extraction) has
-been dropped — MCP tools receive structured JSON arguments.
+This file is a NEW full rewrite based on components/pgvector_combined_v03.py,
+adapted for MCP server usage (JSON-based args, no Langflow glue, no Loop logic).
 
-Two public functions:
-    ingest(rows, collection, dedup_mode, use_task_prefix) -> dict
-    search(query, collection, filter, field_label, field_type, ...) -> dict
+Major enhancements synchronized from V03:
+- Field name normalization (suffix stripping, camelCase splitting, cleanup)
+- clean_value() for removing N/A tokens
+- Field-name suffix configuration (DEFAULT_FIELD_NAME_SUFFIXES + parameter)
+- Ingest document text = label + normalized field name + description
+- Normalized trigram for reranking
+- Search query auto-assembly (label + normalized name + description)
+- Stronger filter parsing + candidate normalization
+- Full backward compatibility with existing APIs
 """
-from __future__ import annotations
 
-import ast
+from __future__ import annotations
 import json
+import ast
+import re
 from difflib import SequenceMatcher
 
 import sqlalchemy
@@ -23,7 +28,7 @@ from config import config
 from embeddings import get_embedder
 
 
-# Default Veeva → LSC type compatibility mapping (from pgvector_combined.py).
+# Default Veeva → LSC type compatibility mapping
 DEFAULT_TYPE_MAPPING = {
     "Picklist": ["picklist"],
     "Multi-Select Picklist": ["picklist"],
@@ -49,16 +54,53 @@ DEFAULT_TYPE_MAPPING = {
     "Formula": ["string", "double", "date", "dateTime", "boolean"],
 }
 
-# Process-level flag so the jsonb migration runs at most once.
+# Suffixes recognized in Veeva/SFDC custom fields
+DEFAULT_FIELD_NAME_SUFFIXES = ["_vod", "__vod", "__c", "_c", "__pc"]
+
+_MISSING_TOKENS = {"", "n/a", "na", "null", "none", "-", "nil"}
+
 _jsonb_ensured = False
 
 
 # ─────────────────────────────────────────────
-# Shared helpers
+# Utility: clean + normalize
+# ─────────────────────────────────────────────
+
+def clean_value(value) -> str:
+    text = (str(value) if value is not None else "").strip()
+    return "" if text.lower() in _MISSING_TOKENS else text
+
+
+def normalize_field_name(name: str, suffixes: list[str] | None = None) -> str:
+    if not name:
+        return ""
+    text = str(name).strip()
+    if not text:
+        return ""
+
+    for suffix in sorted(suffixes or DEFAULT_FIELD_NAME_SUFFIXES, key=len, reverse=True):
+        if suffix and text.lower().endswith(suffix.lower()):
+            text = text[: -len(suffix)]
+            break
+
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
+
+    text = re.sub(r"[^A-Za-z0-9]+", " ", text)
+    return " ".join(text.split()).lower()
+
+
+def trigram_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+# ─────────────────────────────────────────────
+# Basic helpers
 # ─────────────────────────────────────────────
 
 def _connection_string() -> str:
-    """PGVector-compatible SQLAlchemy connection string."""
     conn = str(config.PG_CONNECTION_STRING)
     if conn.startswith("postgresql://"):
         conn = conn.replace("postgresql://", "postgresql+psycopg2://", 1)
@@ -68,30 +110,28 @@ def _connection_string() -> str:
 
 
 def _coerce_to_dict(raw):
-    """Best-effort parse of a value into a dict (JSON → ast → quote-swap)."""
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str) or not raw.strip():
         return None
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         pass
     try:
         return ast.literal_eval(raw)
-    except (ValueError, SyntaxError):
+    except Exception:
         pass
     try:
         return json.loads(raw.replace("'", '"'))
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         return None
 
 
 def _parse_metadata(text: str) -> dict:
-    """Parse one ingest JSON row into mapped metadata (Neo4j-style mapping)."""
     try:
         parsed = json.loads(text)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
     return {
         "system": parsed.get("system", ""),
@@ -105,14 +145,11 @@ def _parse_metadata(text: str) -> dict:
     }
 
 
-# Cache PGVector instances per collection so the underlying SQLAlchemy engine
-# (and its connection pool) is reused across requests instead of being recreated
-# and disposed on every search. Safe for a long-running server process.
+# PGVector instance cache
 _vector_store_cache: dict[str, PGVector] = {}
 
 
 def _get_vector_store(collection: str) -> PGVector:
-    """Return a cached PGVector instance for `collection` (engine/pool reused)."""
     store = _vector_store_cache.get(collection)
     if store is None:
         store = PGVector(
@@ -126,9 +163,7 @@ def _get_vector_store(collection: str) -> PGVector:
 
 
 def _invalidate_vector_store(collection: str) -> None:
-    """Drop a cached PGVector (used after ingest writes new data)."""
     _vector_store_cache.pop(collection, None)
-
 
 
 # ─────────────────────────────────────────────
@@ -136,12 +171,6 @@ def _invalidate_vector_store(collection: str) -> None:
 # ─────────────────────────────────────────────
 
 def _normalize_rows(rows) -> list:
-    """Flatten `rows` (Any) into a list of JSON-string rows.
-
-    Accepts: a JSON-array string, a single JSON-object string, a list of
-    strings/dicts, or a single dict. Each element becomes a JSON string that
-    `_parse_metadata` can parse.
-    """
     if rows is None:
         return []
     if isinstance(rows, str):
@@ -154,6 +183,7 @@ def _normalize_rows(rows) -> list:
             return []
     if isinstance(rows, dict):
         rows = [rows]
+
     out = []
     for item in rows:
         if item is None:
@@ -165,20 +195,28 @@ def _normalize_rows(rows) -> list:
     return out
 
 
-def _prepare_documents(rows, use_task_prefix: bool) -> list[Document]:
+def _prepare_documents(rows, use_task_prefix: bool, field_name_suffixes=None) -> list[Document]:
+    suffixes = _get_suffixes(field_name_suffixes)
     documents: list[Document] = []
+
     for text in _normalize_rows(rows):
         if not text or not text.strip():
             continue
+
         metadata = _parse_metadata(text)
-        # Skip rows where JSON parse failed or required keys are missing.
         if not metadata or not metadata.get("object") or not metadata.get("field"):
             continue
-        field_label = metadata.get("field_label", "")
-        desc = metadata.get("description", "")
-        doc_text = f"{field_label}. {desc}"
+
+        field_label = clean_value(metadata.get("field_label"))
+        desc = clean_value(metadata.get("description"))
+        field_human = normalize_field_name(metadata.get("field", ""), suffixes)
+
+        parts = [p for p in (field_label, field_human, desc) if p]
+        doc_text = ". ".join(parts) if parts else metadata.get("field", "")
+
         if use_task_prefix:
             doc_text = f"search_document: {doc_text}"
+
         documents.append(Document(page_content=doc_text, metadata=metadata))
     return documents
 
@@ -187,8 +225,7 @@ def _collection_uuid_subquery() -> str:
     return "(SELECT uuid FROM langchain_pg_collection WHERE name = :collection_name)"
 
 
-def _apply_dedup(documents: list[Document], collection: str, dedup_mode: str) -> list[Document]:
-    """Apply dedup strategy (scoped to the collection) before writing."""
+def _apply_dedup(documents, collection: str, dedup_mode: str):
     if dedup_mode == "none" or not documents:
         return documents
     try:
@@ -203,6 +240,7 @@ def _apply_dedup(documents: list[Document], collection: str, dedup_mode: str) ->
                     {"collection_name": collection},
                 )
                 conn.commit()
+
             elif dedup_mode == "by_object_field":
                 pairs = {
                     (d.metadata.get("object", ""), d.metadata.get("field", ""))
@@ -215,11 +253,13 @@ def _apply_dedup(documents: list[Document], collection: str, dedup_mode: str) ->
                         sqlalchemy.text(
                             "DELETE FROM langchain_pg_embedding "
                             f"WHERE collection_id = {_collection_uuid_subquery()} "
-                            "AND cmetadata->>'object' = :obj AND cmetadata->>'field' = :fld"
+                            "AND cmetadata->>'object' = :obj "
+                            "AND cmetadata->>'field' = :fld"
                         ),
                         {"collection_name": collection, "obj": obj, "fld": fld},
                     )
                 conn.commit()
+
             elif dedup_mode == "by_content_hash":
                 result = conn.execute(
                     sqlalchemy.text(
@@ -230,14 +270,14 @@ def _apply_dedup(documents: list[Document], collection: str, dedup_mode: str) ->
                 )
                 existing = {row[0] for row in result}
                 documents = [d for d in documents if d.page_content not in existing]
+
         engine.dispose()
-    except Exception as e:  # noqa: BLE001 - collection may not exist on first write
-        print(f">>> dedup skipped/failed (likely first write): {e}")
+    except Exception as e:
+        print(f">>> dedup skipped/failed: {e}")
     return documents
 
 
 def _ensure_jsonb_cmetadata():
-    """Ensure cmetadata is jsonb (needed for ->> / @> filters). Runs once."""
     global _jsonb_ensured
     if _jsonb_ensured:
         return
@@ -264,18 +304,20 @@ def _ensure_jsonb_cmetadata():
             conn.commit()
         engine.dispose()
         _jsonb_ensured = True
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f">>> _ensure_jsonb_cmetadata: {e}")
 
 
 def ingest(rows, collection: str, dedup_mode: str = "by_object_field",
-           use_task_prefix: bool | None = None) -> dict:
-    """Ingest JSON rows into a PGVector collection. Returns {'ingested': n, ...}."""
+           use_task_prefix: bool | None = None,
+           field_name_suffixes: str | None = None) -> dict:
+
     if use_task_prefix is None:
         use_task_prefix = config.EMBEDDING_USE_TASK_PREFIX
 
-    documents = _prepare_documents(rows, use_task_prefix)
+    documents = _prepare_documents(rows, use_task_prefix, field_name_suffixes)
     documents = [d for d in documents if d.page_content and d.page_content.strip()]
+
     if not documents:
         return {"ingested": 0, "dedup_mode": dedup_mode}
 
@@ -290,108 +332,119 @@ def ingest(rows, collection: str, dedup_mode: str = "by_object_field",
         connection_string=_connection_string(),
     )
     _ensure_jsonb_cmetadata()
-    # New data written — drop any cached vector store for this collection so the
-    # next search rebinds cleanly.
     _invalidate_vector_store(collection)
+
     return {"ingested": len(documents), "dedup_mode": dedup_mode}
 
 
-
 # ─────────────────────────────────────────────
-# Filter parsing / normalization
+# Filter
 # ─────────────────────────────────────────────
 
 def _normalize_candidates(candidates) -> dict | None:
-    """Neo4j candidates list → filter dict.
-
-    [{"system":"LSC","object":"A"}, ...] → {"system":"LSC","object":["A", ...]}
-    """
     if not candidates or not isinstance(candidates, list):
         return None
-    objects = [c["object"] for c in candidates if isinstance(c, dict) and "object" in c]
+
+    objects = [c.get("object") for c in candidates if isinstance(c, dict) and "object" in c]
     if not objects:
         return None
-    systems = list({c.get("system", "") for c in candidates
-                    if isinstance(c, dict) and "system" in c})
-    result: dict = {}
+
+    systems = list({c.get("system", "") for c in candidates if isinstance(c, dict)})
+
+    result = {}
     if len(systems) == 1 and systems[0]:
         result["system"] = systems[0]
     result["object"] = objects
     return result
 
 
-def _resolve_from_search_data(search_data, search_query_key, filter_key,
-                              field_label_key, field_type_key):
-    """Extract (query, filter, field_label, field_type) from a unified Search Data JSON.
-
-    Mirrors the original Langflow component's "one JSON in + key names" design,
-    e.g. {"searchQuery": "...", "candidates": [...],
-          "sourceFieldLabel": "...", "sourceFieldType": "..."}.
-
-    `candidates` may use single quotes (Python repr); `_coerce_to_dict` handles that.
-    Returns a dict of the four resolved values (any may be None/"").
-    """
-    data = _coerce_to_dict(search_data) if isinstance(search_data, str) else search_data
-    if not isinstance(data, dict):
-        return {}
-    return {
-        "query": data.get(search_query_key, "") or "",
-        "filter": data.get(filter_key),
-        "field_label": data.get(field_label_key) or None,
-        "field_type": data.get(field_type_key) or None,
-    }
-
-
 def _parse_filter(raw):
-
-    """Parse `filter` (Any). Returns dict, None (no filter), or False (parse failed)."""
-    if not raw:
+    if raw is None:
         return None
+
     filters = _coerce_to_dict(raw) if isinstance(raw, str) else raw
-    # Bare candidates list, e.g. [{"system":"LSC","object":"A"}, ...]
-    # (this is what `search_data["candidates"]` resolves to).
+
     if isinstance(filters, list):
         normalized = _normalize_candidates(filters)
         return normalized if normalized else False
+
     if not isinstance(filters, dict):
         return False
 
-    # Neo4j result format: {"result":[{"candidates":[...]}]}
     if "result" in filters:
         try:
             normalized = _normalize_candidates(filters["result"][0]["candidates"])
             return normalized if normalized else False
-        except (KeyError, IndexError, TypeError):
+        except Exception:
             return False
+
     if "candidates" in filters:
         normalized = _normalize_candidates(filters["candidates"])
         return normalized if normalized else False
+
     return filters
 
 
 # ─────────────────────────────────────────────
-# Search execution + hybrid rerank
+# Search-data extraction
 # ─────────────────────────────────────────────
 
-def _trigram(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+def _get_suffixes(raw_suffixes):
+    if isinstance(raw_suffixes, str) and raw_suffixes.strip():
+        parts = [s.strip() for s in raw_suffixes.split(",") if s.strip()]
+        if parts:
+            return parts
+    return DEFAULT_FIELD_NAME_SUFFIXES
 
+
+def _resolve_from_search_data(search_data,
+                              search_query_key,
+                              filter_key,
+                              field_label_key,
+                              field_type_key,
+                              field_name_key=None,
+                              field_description_key=None,
+                              field_name_suffixes=None):
+    data = _coerce_to_dict(search_data) if isinstance(search_data, str) else search_data
+    if not isinstance(data, dict):
+        return {}
+
+    query = data.get(search_query_key, "") or ""
+    filter_val = data.get(filter_key)
+    field_label = data.get(field_label_key) or None
+    field_type = data.get(field_type_key) or None
+
+    suffixes = _get_suffixes(field_name_suffixes)
+
+    # Auto-assemble in V03 format
+    if (field_name_key and field_name_key in data) or (field_description_key and field_description_key in data):
+        raw_name = str(data.get(field_name_key, "")) if field_name_key else ""
+        raw_desc = str(data.get(field_description_key, "")) if field_description_key else ""
+        label_part = clean_value(field_label) if field_label else ""
+        name_part = normalize_field_name(raw_name, suffixes)
+        desc_part = clean_value(raw_desc)
+        parts = [p for p in (label_part, name_part, desc_part) if p]
+        assembled = ". ".join(parts) if parts else raw_name.strip()
+        if assembled:
+            query = assembled
+
+    return {
+        "query": query,
+        "filter": filter_val,
+        "field_label": field_label,
+        "field_type": field_type,
+    }
+
+
+# ─────────────────────────────────────────────
+# Search execution
+# ─────────────────────────────────────────────
 
 def _execute_search_with_score(vector_store, filters, query: str, k: int) -> list:
-    """Similarity search → [(doc, distance), ...]; supports multi-value filters.
-
-    Perf: the query is embedded **exactly once** (embedding is the slowest step,
-    especially with a remote provider like watsonx), then reused via
-    `similarity_search_with_score_by_vector`. Multi-value filters are issued as a
-    single `IN` query instead of one query per value.
-    """
-    # Embed the query a single time and reuse the vector for every DB call.
     embedding = vector_store.embedding_function.embed_query(query)
 
     if not filters:
-        return vector_store.similarity_search_with_score_by_vector(embedding=embedding, k=k)
+        return vector_store.similarity_search_with_score_by_vector(embedding, k=k)
 
     multi_keys = {kk: v for kk, v in filters.items() if isinstance(v, list)}
     if not multi_keys:
@@ -399,49 +452,57 @@ def _execute_search_with_score(vector_store, filters, query: str, k: int) -> lis
             embedding=embedding, k=k, filter=filters
         )
 
-    # Multi-value: prefer a single `IN` query (PGVector supports the `in` op).
     base = {kk: v for kk, v in filters.items() if not isinstance(v, list)}
     in_filter = {**base, **{kk: {"in": v} for kk, v in multi_keys.items()}}
+
     try:
         return vector_store.similarity_search_with_score_by_vector(
             embedding=embedding, k=k, filter=in_filter
         )
-    except Exception as e:  # noqa: BLE001 - fallback if `in` op unsupported
-        print(f">>> 'in' filter unsupported, falling back to per-value: {e}")
-
-    # Fallback: per-value queries, but still reuse the single embedding above.
-    key, values = next(iter(multi_keys.items()))
-    per_k = max(2, k)
-    seen = set()
-    merged = []
-    for val in values:
-        single = {**base, key: val}
-        try:
-            for doc, score in vector_store.similarity_search_with_score_by_vector(
-                embedding=embedding, k=per_k, filter=single
-            ):
-                if doc.page_content not in seen:
-                    seen.add(doc.page_content)
-                    merged.append((doc, score))
-        except Exception as e:  # noqa: BLE001
-            print(f">>> search error for {single}: {e}")
-    merged.sort(key=lambda x: x[1])
-    return merged
+    except Exception:
+        print(">>> IN filter unsupported, fallback")
+        key, values = next(iter(multi_keys.items()))
+        per_k = max(2, k)
+        seen = set()
+        merged = []
+        for val in values:
+            single = {**base, key: val}
+            try:
+                for doc, score in vector_store.similarity_search_with_score_by_vector(
+                    embedding=embedding, k=per_k, filter=single
+                ):
+                    if doc.page_content not in seen:
+                        seen.add(doc.page_content)
+                        merged.append((doc, score))
+            except Exception:
+                pass
+        merged.sort(key=lambda x: x[1])
+        return merged
 
 
+# ─────────────────────────────────────────────
+# Rerank
+# ─────────────────────────────────────────────
 
 def _get_type_mapping(type_mapping) -> dict:
     parsed = _coerce_to_dict(type_mapping) if type_mapping else None
     return parsed if isinstance(parsed, dict) else DEFAULT_TYPE_MAPPING
 
 
-def _rerank(docs_with_scores, field_label, field_type,
-            vector_weight, trigram_weight, type_weight, type_mapping) -> list:
-    """Weighted rerank: vector + trigram + type compatibility."""
+def _rerank(docs_with_scores,
+            field_label,
+            field_type,
+            vector_weight,
+            trigram_weight,
+            type_weight,
+            type_mapping,
+            field_name_suffixes=None):
     if not docs_with_scores:
         return []
+
     type_map = _get_type_mapping(type_mapping)
     compatible = []
+
     if field_type:
         compatible = type_map.get(field_type, [])
         if not compatible:
@@ -449,45 +510,68 @@ def _rerank(docs_with_scores, field_label, field_type,
                 if k.lower() == field_type.lower():
                     compatible = v
                     break
+
+    suffixes = _get_suffixes(field_name_suffixes)
+    veeva_norm = normalize_field_name(field_label, suffixes) if field_label else ""
+
     reranked = []
+
     for doc, distance in docs_with_scores:
         vec_score = 1.0 / (1.0 + distance)
-        trgm = 0.0
-        if field_label and doc.metadata:
-            trgm = max(
-                _trigram(field_label, doc.metadata.get("field_label", "")),
-                _trigram(field_label, doc.metadata.get("field", "")),
-            )
+
+        trgm_score = 0.0
+        if veeva_norm:
+            lsc_label = doc.metadata.get("field_label", "") if doc.metadata else ""
+            lsc_field = doc.metadata.get("field", "") if doc.metadata else ""
+            trgm_label_score = trigram_similarity(veeva_norm, normalize_field_name(lsc_label, suffixes))
+            trgm_field_score = trigram_similarity(veeva_norm, normalize_field_name(lsc_field, suffixes))
+            trgm_score = max(trgm_label_score, trgm_field_score)
+
         type_score = 0.0
         if compatible and doc.metadata:
             lsc_type = doc.metadata.get("field_type", "")
             if lsc_type and lsc_type.lower() in [t.lower() for t in compatible]:
                 type_score = 1.0
-        final = vec_score * vector_weight + trgm * trigram_weight + type_score * type_weight
-        reranked.append((doc, final))
+
+        final_score = (
+            vec_score * vector_weight
+            + trgm_score * trigram_weight
+            + type_score * type_weight
+        )
+        reranked.append((doc, final_score))
+
     reranked.sort(key=lambda x: x[1], reverse=True)
     return reranked
 
 
-def search(query: str | None = None, collection: str = "", filter=None,
-           field_label: str | None = None, field_type: str | None = None,
+# ─────────────────────────────────────────────
+# Public search()
+# ─────────────────────────────────────────────
+
+def search(query: str | None = None, collection: str = "",
+           filter=None, field_label: str | None = None, field_type: str | None = None,
            number_of_results: int = 5, recall_top_k: int = 50,
            vector_weight: float = 0.5, trigram_weight: float = 0.35,
            type_weight: float = 0.15, type_mapping=None,
-           search_data=None, search_query_key: str = "searchQuery",
-           filter_key: str = "candidates", field_label_key: str = "sourceFieldLabel",
-           field_type_key: str = "sourceFieldType") -> dict:
-    """Filtered vector search + hybrid rerank. Returns {'results':[...], 'count': n}.
+           search_data=None,
+           search_query_key: str = "searchQuery",
+           filter_key: str = "candidates",
+           field_label_key: str = "sourceFieldLabel",
+           field_type_key: str = "sourceFieldType",
+           field_name_key: str | None = None,
+           field_description_key: str | None = None,
+           field_name_suffixes: str | None = None) -> dict:
 
-    Two input styles (mirrors the original Langflow component):
-      1. Unified `search_data` JSON + key names (searchQuery/candidates/
-         sourceFieldLabel/sourceFieldType). Used when `search_data` is provided.
-      2. Discrete `query`/`filter`/`field_label`/`field_type` arguments.
-    Discrete args, when set, override values resolved from `search_data`.
-    """
     if search_data is not None:
         resolved = _resolve_from_search_data(
-            search_data, search_query_key, filter_key, field_label_key, field_type_key
+            search_data,
+            search_query_key,
+            filter_key,
+            field_label_key,
+            field_type_key,
+            field_name_key=field_name_key,
+            field_description_key=field_description_key,
+            field_name_suffixes=field_name_suffixes,
         )
         if resolved:
             query = query if (query and str(query).strip()) else resolved.get("query")
@@ -499,24 +583,26 @@ def search(query: str | None = None, collection: str = "", filter=None,
         return {"results": [], "count": 0}
     query = str(query).strip()
 
-
     filters = _parse_filter(filter)
     if filters is False:
-        # Filter provided but unparseable — return empty (avoid unfiltered leak).
         return {"results": [], "count": 0, "error": "filter provided but failed to parse"}
 
-    # NOTE: the vector store is cached (engine/connection pool reused across
-    # requests), so we must NOT dispose its engine here.
     vector_store = _get_vector_store(collection)
     docs_with_scores = _execute_search_with_score(
         vector_store, filters, query, k=recall_top_k
     )
 
-
     reranked = _rerank(
-        docs_with_scores, field_label, field_type,
-        vector_weight, trigram_weight, type_weight, type_mapping,
+        docs_with_scores,
+        field_label,
+        field_type,
+        vector_weight,
+        trigram_weight,
+        type_weight,
+        type_mapping,
+        field_name_suffixes,
     )
+
     top = reranked[:number_of_results]
 
     results = []
@@ -524,7 +610,5 @@ def search(query: str | None = None, collection: str = "", filter=None,
         meta = dict(doc.metadata) if doc.metadata else {}
         meta["final_score"] = round(final_score, 4)
         results.append({"text": doc.page_content, "metadata": meta})
+
     return {"results": results, "count": len(results)}
-
-
-
