@@ -11,10 +11,13 @@ All APIs remain backward compatible.
 """
 
 from __future__ import annotations
+import ast
+import functools
 import json
 import logging
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 from config import config
@@ -50,7 +53,12 @@ def _coerce_params(params) -> dict:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
-        parsed = json.loads(text)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Fallback for Python-style repr (single quotes, etc.) that
+            # Langflow templates can emit instead of strict JSON.
+            parsed = ast.literal_eval(text)
         if not isinstance(parsed, dict):
             raise ValueError(f"params JSON must be dict, got {type(parsed).__name__}")
         return parsed
@@ -71,21 +79,41 @@ def neo4j_query(cypher: str, params: Any = None) -> dict:
 
 
 @mcp.tool()
-def pgvector_ingest(
-    rows: Any,
-    collection: str,
-    dedup_mode: str = "by_object_field",
-    use_task_prefix: bool | None = None,
-    field_name_suffixes: str | None = None,
-) -> dict:
-    """Ingest JSON field rows into PGVector with V03-enhanced normalization."""
+async def pgvector_ingest(input_data: Any) -> dict:
+    """Ingest field data into PGVector from a single JSON payload.
+
+    Expects one object (dict or JSON string) shaped like::
+
+        {
+          "data": { ...field... } | [ {...}, ... ],   # required
+          "collection": "<collection name>",           # required
+          "dedup_mode": "by_object_field",             # optional
+          "use_task_prefix": false,                     # optional
+          "field_name_suffixes": "_vod,__c"            # optional
+        }
+
+    The field data lives under "data"; collection/dedup settings ride along
+    in the same object so the tool exposes just one input handle.
+    """
     try:
-        result = pgvector_ingest_fn(
-            rows=rows,
-            collection=collection,
-            dedup_mode=dedup_mode,
-            use_task_prefix=use_task_prefix,
-            field_name_suffixes=field_name_suffixes,
+        payload = _coerce_params(input_data)
+
+        collection = payload.get("collection")
+        if not collection:
+            return {"error": "collection is required in input_data", "ingested": 0}
+
+        # Run the blocking ingest (embedding calls + DB writes) in a worker
+        # thread so the async event loop stays free to keep the MCP streamable
+        # HTTP transport responsive and avoid client-side read timeouts.
+        result = await anyio.to_thread.run_sync(
+            functools.partial(
+                pgvector_ingest_fn,
+                rows=payload.get("data"),  # field data lives under the "data" key
+                collection=collection,
+                dedup_mode=payload.get("dedup_mode", "by_object_field"),
+                use_task_prefix=payload.get("use_task_prefix"),
+                field_name_suffixes=payload.get("field_name_suffixes"),
+            )
         )
         logger.info("pgvector_ingest OK: %s", result)
         return result
