@@ -80,43 +80,45 @@ def neo4j_query(cypher: str, params: Any = None) -> dict:
 
 @mcp.tool()
 async def pgvector_ingest(
-    data: Any,
-    collection: str,
+    data: Any = None,
+    collection: str | None = None,
     dedup_mode: str = "by_object_field",
     use_task_prefix: bool | None = None,
     field_name_suffixes: str | None = None,
+    input_data: Any = None,
 ) -> dict:
     """Ingest field data into a PGVector collection.
 
     Args:
-        data: The field record(s) to embed and store — either a list of field
-            objects or a single object. Each object looks like::
-
-                {
-                  "system": "LSC", "object": "Account",
-                  "objectdescription": "...", "company": "abbott",
-                  "fieldname": "LastViewedDate", "fieldlabel": "Last Viewed Date",
-                  "fielddescription": "...", "datatype": "datetime"
-                }
-
-        collection: Target PGVector collection (table) name.
-        dedup_mode: One of "by_object_field" (default), "pre_delete_all",
-            "by_content_hash", or "none".
-        use_task_prefix: Optional; add nomic-style task prefixes when embedding.
-        field_name_suffixes: Optional comma-separated suffixes stripped from
-            field names during normalization, e.g. "_vod,__c".
+        data: list of field objects (or a single object) to embed and store.
+            Each object looks like {"system","object","objectdescription",
+            "company","fieldname","fieldlabel","fielddescription","datatype"}.
+        collection: target PGVector collection (table) name.
+        dedup_mode: "by_object_field" (default) | "pre_delete_all" |
+            "by_content_hash" | "none".
+        use_task_prefix / field_name_suffixes: optional embedding tweaks.
+        input_data: optional single object carrying all of the above.
 
     Returns:
         {"ingested": <count>, "dedup_mode": <mode>} on success, or
         {"error": <message>, "ingested": 0} on failure.
     """
     try:
+        if input_data is not None:
+            payload = _coerce_params(input_data)
+            data = payload.get("data", payload.get("rows", data))
+            collection = payload.get("collection", collection)
+            dedup_mode = payload.get("dedup_mode", dedup_mode)
+            if payload.get("use_task_prefix") is not None:
+                use_task_prefix = payload.get("use_task_prefix")
+            if payload.get("field_name_suffixes") is not None:
+                field_name_suffixes = payload.get("field_name_suffixes")
+
         if not collection:
             return {"error": "collection is required", "ingested": 0}
+        if data is None:
+            return {"error": "data is required", "ingested": 0}
 
-        # Run the blocking ingest (embedding calls + DB writes) in a worker
-        # thread so the async event loop stays free to keep the MCP streamable
-        # HTTP transport responsive and avoid client-side read timeouts.
         result = await anyio.to_thread.run_sync(
             functools.partial(
                 pgvector_ingest_fn,
