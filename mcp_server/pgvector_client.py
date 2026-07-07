@@ -109,29 +109,71 @@ def _connection_string() -> str:
     return conn
 
 
+def _strip_code_fence(text: str) -> str:
+    """Strip a leading/trailing markdown code fence (```json ... ```)."""
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.split("\n")
+        lines = lines[1:]  # drop the opening ``` / ```json line
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
+
+
 def _coerce_to_dict(raw):
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str) or not raw.strip():
         return None
+    text = _strip_code_fence(raw)
     try:
-        return json.loads(raw)
+        return json.loads(text)
     except Exception:
         pass
     try:
-        return ast.literal_eval(raw)
+        return ast.literal_eval(text)
     except Exception:
         pass
     try:
-        return json.loads(raw.replace("'", '"'))
+        return json.loads(text.replace("'", '"'))
     except Exception:
         return None
+
+
+# Wrapper keys that may nest the actual field row(s) produced by upstream
+# Langflow components (e.g. Parser "Stringify" emits {"results": [...]}).
+_WRAPPER_KEYS = ("data", "results", "records")
+
+
+def _unwrap_data(obj):
+    """Unwrap payloads that nest the field row(s) under a wrapper key.
+
+    Handles single or nested wrappers such as {"data": [...]},
+    {"results": [...]} or {"data": {"results": [...]}}, returning the
+    innermost list/dict. Plain row dicts (no wrapper key) pass through
+    unchanged.
+    """
+    depth = 0
+    while isinstance(obj, dict) and depth < 5:
+        for key in _WRAPPER_KEYS:
+            inner = obj.get(key)
+            if isinstance(inner, (dict, list)):
+                obj = inner
+                break
+        else:
+            break
+        depth += 1
+    return obj
 
 
 def _parse_metadata(text: str) -> dict:
     try:
         parsed = json.loads(text)
     except Exception:
+        return {}
+    parsed = _unwrap_data(parsed)
+    if not isinstance(parsed, dict):
         return {}
     return {
         "system": parsed.get("system", ""),
@@ -175,18 +217,29 @@ def _normalize_rows(rows) -> list:
         return []
     if isinstance(rows, str):
         parsed = _coerce_to_dict(rows)
-        if isinstance(parsed, list):
-            rows = parsed
-        elif isinstance(parsed, dict):
-            rows = [parsed]
-        else:
+        if parsed is None:
             return []
+        rows = parsed
+
+    # Strip any {"data"/"results"/"records": ...} wrapper(s) around the rows.
+    rows = _unwrap_data(rows)
     if isinstance(rows, dict):
         rows = [rows]
+    if not isinstance(rows, list):
+        return []
 
     out = []
     for item in rows:
         if item is None:
+            continue
+        if isinstance(item, dict):
+            item = _unwrap_data(item)
+        if isinstance(item, list):
+            for sub in item:
+                if isinstance(sub, dict):
+                    out.append(json.dumps(sub, ensure_ascii=False))
+                elif sub is not None:
+                    out.append(str(sub))
             continue
         if isinstance(item, dict):
             out.append(json.dumps(item, ensure_ascii=False))
