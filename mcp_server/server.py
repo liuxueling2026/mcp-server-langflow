@@ -162,15 +162,15 @@ def pgvector_search(
             field_name_suffixes=opts.get("field_name_suffixes", "_vod,__vod,__c,_c,__pc"),
         )
         logger.info("pgvector_search OK: %d results", result.get("count", 0))
-        # Return the bare list of result rows (each {"text", "metadata"}). FastMCP
-        # emits one content item per list element, so the Langflow MCP node yields a
-        # multi-row Table (one row per candidate, with a `metadata` column) instead of
-        # a single row that traps the whole list in one cell. An empty list yields an
-        # empty table downstream (no KeyError in the Parser).
-        return result.get("results", [])
+        # Unified return contract expected by the ICA A2A agent runtime: a top-level
+        # "records" array (same shape as neo4j_query -> {"records": [...], "count": N}).
+        # The agent normalizer errors with "missing expected 'records' array" if the
+        # tool returns a bare list, so expose the result rows under "records".
+        rows = result.get("results", [])
+        return {"records": rows, "count": result.get("count", len(rows))}
     except Exception as e:
         logger.exception("pgvector_search failed")
-        return []
+        return {"error": str(e), "records": [], "count": 0}
 
 
 if __name__ == "__main__":
