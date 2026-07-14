@@ -88,10 +88,14 @@ def pgvector_ingest(
             field_name_suffixes=field_name_suffixes,
         )
         logger.info("pgvector_ingest OK: %s", result)
-        return result
+        # Wrap in the unified {records, count} contract the ICA A2A agent expects.
+        # The ingest summary (ingested count, dedup_mode) is exposed as a single
+        # record so the agent's normalizer finds a "records" array and does not
+        # error with "missing expected 'records' array".
+        return {"records": [result], "count": result.get("ingested", 0)}
     except Exception as e:
         logger.exception("pgvector_ingest failed")
-        return {"error": str(e), "ingested": 0}
+        return {"error": str(e), "records": [], "count": 0}
 
 
 @mcp.tool()  # type: ignore[misc]
