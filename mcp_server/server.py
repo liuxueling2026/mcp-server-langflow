@@ -19,8 +19,6 @@ from mcp.server.fastmcp import FastMCP
 
 from config import config
 from neo4j_client import run_cypher
-from pgvector_client import ingest as pgvector_ingest_fn
-from pgvector_client import search as pgvector_search_fn
 
 
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +55,7 @@ def _coerce_params(params) -> dict:
     raise ValueError(f"Unsupported params type: {type(params).__name__}")
 
 
-@mcp.tool()
+@mcp.tool()  # type: ignore[misc]
 def neo4j_query(cypher: str, params: Any = None) -> dict:
     """Execute parameterized Cypher query."""
     try:
@@ -70,7 +68,7 @@ def neo4j_query(cypher: str, params: Any = None) -> dict:
         return {"error": str(e), "records": [], "count": 0}
 
 
-@mcp.tool()
+@mcp.tool()  # type: ignore[misc]
 def pgvector_ingest(
     rows: Any,
     collection: str,
@@ -80,6 +78,8 @@ def pgvector_ingest(
 ) -> dict:
     """Ingest JSON field rows into PGVector with V03-enhanced normalization."""
     try:
+        from pgvector_client import ingest as pgvector_ingest_fn
+
         result = pgvector_ingest_fn(
             rows=rows,
             collection=collection,
@@ -94,56 +94,83 @@ def pgvector_ingest(
         return {"error": str(e), "ingested": 0}
 
 
-@mcp.tool()
+@mcp.tool()  # type: ignore[misc]
 def pgvector_search(
     collection: str,
     search_data: Any = None,
     query: str = "",
-    filter: Any = None,
-    field_label: str = "",
-    field_type: str = "",
-    search_query_key: str = "searchQuery",
-    filter_key: str = "candidates",
-    field_label_key: str = "sourceFieldLabel",
-    field_type_key: str = "sourceFieldType",
-    field_name_key: str = "",
-    field_description_key: str = "",
-    field_name_suffixes: str = "",
     number_of_results: int = 5,
     recall_top_k: int = 50,
     vector_weight: float = 0.5,
     trigram_weight: float = 0.35,
     type_weight: float = 0.15,
-    type_mapping: Any = None,
+    options: Any = None,
 ) -> dict:
-    """Search a PGVector collection with V03-enhanced reranking & normalization."""
+    """Search a PGVector collection with V03-enhanced reranking & normalization.
+
+    The rarely-changed key/field mapping settings are folded into the optional
+    ``options`` dict (accepts a dict or a JSON string) so the Langflow control
+    stays short. Leave it empty to use the defaults below:
+
+        {
+            "search_query_key": "searchQuery",
+            "filter_key": "candidates",
+            "field_label_key": "sourceFieldLabel",
+            "field_type_key": "sourceFieldType",
+            "field_name_key": "sourceFieldName",
+            "field_description_key": "sourceFieldDescription",
+            "field_name_suffixes": "_vod,__vod,__c,_c,__pc",
+            "field_label": "",
+            "field_type": "",
+            "filter": null,
+            "type_mapping": null
+        }
+    """
+    opts = options or {}
+    if isinstance(opts, str):
+        import json
+
+        try:
+            opts = json.loads(opts) or {}
+        except (json.JSONDecodeError, ValueError):
+            opts = {}
+    if not isinstance(opts, dict):
+        opts = {}
+
     try:
+        from pgvector_client import search as pgvector_search_fn
+
         result = pgvector_search_fn(
             query=query,
             collection=collection,
-            filter=filter,
-            field_label=field_label,
-            field_type=field_type,
+            filter=opts.get("filter"),
+            field_label=opts.get("field_label", ""),
+            field_type=opts.get("field_type", ""),
             number_of_results=number_of_results,
             recall_top_k=recall_top_k,
             vector_weight=vector_weight,
             trigram_weight=trigram_weight,
             type_weight=type_weight,
-            type_mapping=type_mapping,
+            type_mapping=opts.get("type_mapping"),
             search_data=search_data,
-            search_query_key=search_query_key,
-            filter_key=filter_key,
-            field_label_key=field_label_key,
-            field_type_key=field_type_key,
-            field_name_key=field_name_key,
-            field_description_key=field_description_key,
-            field_name_suffixes=field_name_suffixes,
+            search_query_key=opts.get("search_query_key", "searchQuery"),
+            filter_key=opts.get("filter_key", "candidates"),
+            field_label_key=opts.get("field_label_key", "sourceFieldLabel"),
+            field_type_key=opts.get("field_type_key", "sourceFieldType"),
+            field_name_key=opts.get("field_name_key", "sourceFieldName"),
+            field_description_key=opts.get("field_description_key", "sourceFieldDescription"),
+            field_name_suffixes=opts.get("field_name_suffixes", "_vod,__vod,__c,_c,__pc"),
         )
         logger.info("pgvector_search OK: %d results", result.get("count", 0))
-        return result
+        # Return the bare list of result rows (each {"text", "metadata"}). FastMCP
+        # emits one content item per list element, so the Langflow MCP node yields a
+        # multi-row Table (one row per candidate, with a `metadata` column) instead of
+        # a single row that traps the whole list in one cell. An empty list yields an
+        # empty table downstream (no KeyError in the Parser).
+        return result.get("results", [])
     except Exception as e:
         logger.exception("pgvector_search failed")
-        return {"error": str(e), "results": [], "count": 0}
+        return []
 
 
 if __name__ == "__main__":

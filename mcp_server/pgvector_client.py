@@ -167,6 +167,38 @@ def _unwrap_data(obj):
     return obj
 
 
+def _unwrap_to_row(obj, max_depth: int = 10):
+    """Peel wrapper keys AND single-element lists down to the field-row dict.
+
+    Unlike ``_unwrap_data`` (which stops at the first list, as ingest needs the
+    full row list), this keeps descending through single-element lists so a
+    search payload nested like ``{"results": [{"records": [row]}]}`` — the shape
+    Langflow produces from an MCP ``neo4j_query`` result — resolves to ``row``.
+    A plain field-row dict (no wrapper key) passes through unchanged, because the
+    row's own keys (sourceFieldName/candidates/...) are not wrapper keys.
+    """
+    depth = 0
+    while depth < max_depth:
+        if isinstance(obj, list):
+            if len(obj) == 1:
+                obj = obj[0]
+                depth += 1
+                continue
+            break
+        if isinstance(obj, dict):
+            for key in _WRAPPER_KEYS:
+                inner = obj.get(key)
+                if isinstance(inner, (dict, list)):
+                    obj = inner
+                    break
+            else:
+                break
+            depth += 1
+            continue
+        break
+    return obj
+
+
 def _parse_metadata(text: str) -> dict:
     try:
         parsed = json.loads(text)
@@ -459,6 +491,14 @@ def _resolve_from_search_data(search_data,
                               field_description_key=None,
                               field_name_suffixes=None):
     data = _coerce_to_dict(search_data) if isinstance(search_data, str) else search_data
+    # Peel any {"results": [{"records": [row]}]} wrapper Langflow adds around the
+    # neo4j_query result so the row's own keys resolve at the top level.
+    data = _unwrap_to_row(data)
+    # If the caller passed the full request wrapper (collection/weights/... plus a
+    # nested "search_data" object), descend into that inner object where the actual
+    # field row (sourceFieldName/candidates/...) lives.
+    if isinstance(data, dict) and isinstance(data.get("search_data"), dict):
+        data = data["search_data"]
     if not isinstance(data, dict):
         return {}
 

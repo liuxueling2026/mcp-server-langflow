@@ -38,10 +38,20 @@ class Config:
 
     # ── Embedding provider (pluggable) ─────────
     EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "ollama")
-    EMBEDDING_MODEL: str | None = os.getenv("EMBEDDING_MODEL")
-    EMBEDDING_MODEL_NAME: str | None = os.getenv("EMBEDDING_MODEL_NAME")
+    # Canonical embedding model setting. Prefer EMBEDDING_MODEL, but keep
+    # backward compatibility with older .env files that used
+    # EMBEDDING_MODEL_NAME.
+    EMBEDDING_MODEL: str | None = os.getenv("EMBEDDING_MODEL") or os.getenv("EMBEDDING_MODEL_NAME")
+    # Backward-compatible alias kept for older code paths / diagnostics.
+    EMBEDDING_MODEL_NAME: str | None = EMBEDDING_MODEL
     EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL", "http://localhost:11434")
     EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
+    # Optional HTTP(S) proxy applied ONLY to embedding-provider requests
+    # (e.g. reaching public api.cohere.com from a restricted network). Leaving
+    # it empty means embedding calls go direct. This never affects the MCP
+    # server socket or other connections (Neo4j/PG), so no global system proxy
+    # is needed. Example: http://127.0.0.1:7890
+    EMBEDDING_PROXY: str = os.getenv("EMBEDDING_PROXY", "")
     EMBEDDING_USE_TASK_PREFIX: bool = (
         os.getenv("EMBEDDING_USE_TASK_PREFIX", "false").lower() in ("1", "true", "yes")
     )
@@ -56,8 +66,8 @@ class Config:
     def validate_watsonx(cls) -> list[str]:
         missing = []
         if cls.EMBEDDING_PROVIDER.lower() == "watsonx":
-            if not cls.EMBEDDING_MODEL_NAME:
-                missing.append("EMBEDDING_MODEL_NAME")
+            if not cls.EMBEDDING_MODEL:
+                missing.append("EMBEDDING_MODEL")
             if not cls.WATSONX_API_KEY:
                 missing.append("WATSONX_API_KEY")
             if not cls.WATSONX_PROJECT_ID:
